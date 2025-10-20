@@ -1,0 +1,276 @@
+BATCH_REDACTION (Redaction 1.1)
+Important linksCONTENTS
+Important links
+Project team (contact people) 
+Background & Research
+Product Brief
+Problem Discovery
+Why are we doing this? And why should we do this now?
+User Personas
+Industries
+Solution Discovery
+Goal and Value Proposition 
+Impact
+Success metric
+Legacy information
+Discussion with CS/Sales/Users
+Aimed Release
+Price
+Meeting summaries
+Tasks
+Project Completion Checklist
+Project Specific Tasks
+Tasks from Meetings
+Sub-pages
+Search
+Jira Epic
+Figma design conceptResource Link Details
+[DBT-41280] Redaction
+v.1.1 (Non-Semantic) -
+Jira (atlassian.net)Project team (contact people) 
+PM Lead:  @Johannes Graf
+BE Lead: 
+FE: Lead: 
+QA Lead: 
+Design Lead: 
+CS Lead(s): 
+Background & Research
+Product Brief
+The goal of this project is to release batch redaction - the redaction of multiple documents in
+one process
+Users will be able to select multiple files and folders and the processDBT-47236: Batch sav
+e redacted copiesDONE will directly create redacted copies
+They will be able to apply AI categories DBT-46990: Batch redaction by categoriesDONE
+and multiple search terms DBT-46991: Batch redaction by search termsDONE
+The batch redaction process creates multiple redacted copies without user confirmation of
+individual documents or markups
+Users are informed via DBT-47237: Reports and NotificationsDONE  about
+pre-redaction report: files that can/cannot be redacted before applying redaction 
+post-redaction report: files that were not redacted due to missing matches or technical
+errors
+notifications: the current processMiro board
+Feature requests RICE scored requestsRedaction 1.1 & agile
+Kickoff, Visual
+Workspace for
+Innovation (miro.com)
+Problem Discovery
+Why are we doing this? And why should we do this now?
+Single document redaction is not sufficient when users need to redact a lot of files. Especially in
+M&A deals, users have to redact a ton of documents. There is also a need for NPL transactions,
+where there is less document variety but lot of quantity.User Personas
+Industries
+Solution Discovery
+Goal and Value Proposition 
+Like in with single-document redaction, the value proposition for batch
+redaction in a data room lies in its ability to streamline and enhance the
+security of document management processes. This feature ensures
+compliance with privacy regulations and confidentiality requirements,
+mitigating the risk of data breaches and legal liabilities.
+By employing batch redaction, users can efficiently hide sensitive information
+across multiple documents simultaneously, saving considerable time and
+effort compared to manual redaction and single-document redaction. 
+Impact
+Given that  approximately 66% of our customers consider Redaction as a
+must-have (23%) or a nice to have (43%), redaction is very important for us.
+Unfortunately, our competitors were the first-movers with redaction. By
+offering, batch redaction, we can an advantage against our competitors and
+potentially regain lost customers 
+User Impact
+This section explores how the software can
+address user needs, enhance efficiency,
+reduce costs, or provide any other positive
+outcomes that users are likely to encounter. Company Impact
+This may include factors such as increased
+revenue, improved operational efficiency,
+enhanced reputation, or market differentiation.Success metric
+List 3 Success metrics as draft for open discussion.
+Batch redaction adoption rate
+number of 
+Legacy information
+Discussion with CS/Sales/Users
+Customer Success
+CS currently uses an expensive external tool (Nymiz) to handle batch redaction (specifically
+for NPLs)
+1. Icon for draft documents not just redacted ones
+a. Also contnue redaction instrad of start redaction
+2. Bulk redaction
+a. Batch apply to folder
+3. Needs to be highlighted what categories were selected
+4. Whitelisting
+a. Batch upload a list as excel/csv
+5. Blacklisting
+a. Batch upload a list as excel/csv
+6. Directly select word in doc viewer
+a. Add word to blacklist or whitelist
+7. Select word to assign it to category
+a. Poisoning model
+8. Excel doc
+a. Redaction excelMore efficiency on redaction process for
+multiple docsMore deals closed due to (batch) redaction
+USP against competitors
+More redacted documents →  more revenue
+for Drooms
+REDACTION - PRODUCT-projects - Confluence (atlassian.net)b. Also deleted data on excel viewer
+9. Search not easy to find mistake with OCR
+a. With redaction you see OCR errors
+Aimed Release
+TBD
+Price
+Batch redaction is an individual module and can be priced individually
+Additional revenue due to more redacted pages
+Possibility to Price batch redaction separately or within a bundle of features
+Meeting summaries
+ Not found: TEMPLATE_<PROJECT_NAME>_Meeting_notes.
+Tasks
+Project Completion Checklist
+Meeting minutes recorded and tracked in below pages.
+Unable to render {children}.
+Before starting
+each project, make
+sure you have
+checked the below
+common tasks. Kick-
+Off Call preparation
+NOT RELEVANTDONE
+IN PROGRESS
+Research and
+Preparation Phase –
+Check all points
+below for completion
+NOT RELEVANTDONE
+IN PROGRESS
+Ready for
+development Phase –
+Check all points
+below for completion
+(phase can be
+overlapped with
+previous one to
+speed up and be
+agile)
+NOT RELEVANTDONE
+IN PROGRESS
+In Work – Check all
+points below for
+completion, this
+includes Rollout
+preparation by PMs
+NOT RELEVANTDONE
+IN PROGRESS
+Create an Epic in Jira, link it
+to this project spaceExtend competitor research
+and complete Competitor,QA ticket estimates All BE tickets completedMarket, Trend research
+Template
+Set estimated Start and End
+dates of Epic for Research
+Preparation statusDefine clear project
+requirements for design
+and developers make use
+of Jobs to be done or
+simple user story
+frameworkQA testing ticket creationAll FE Tickets completed
+Create 
+ in
+ConfluenceProject
+Documentation pageCreate User flows and link
+Miro boardFE and BE Technical task
+creation was completedQA testing completed
+Add general background
+informationGather relevant data on
+time, define metrics in
+exchange with Developers
+and stakeholdersFE estimated all User
+storiesMarketing and Design
+briefing prepared (can be
+done earlier as well)
+Add all links, including
+feature requestsUser Journey and final flow
+(Lo-fi/Wireframes) finalizedinitial Release date estimate
+availableAlignment and final plan for
+marketing activities and
+campaigns
+Complete the Product Brief
+TemplateTechnical Research by
+developers completedInform Help Center team
+enough time in advance, in
+case visual changes will
+happen that would affect
+their content.Feature announcement in
+Product announcement
+prepared and developed
+Plan a kick-off call
+including all features leads,
+CS Leads, and other
+relevant stakeholders
+(Marketing, Finance, Sales)
+and bring project docs and
+product brief as the
+foundationHi-fi/final designs createdhave a regular status check
+and update exchange with
+stakeholdersEffect on guided tours,
+updated or new one
+created, tested, code
+added from devs and
+released
+Plan recurring meetings
+with the core team and
+extended stakeholder team
+in the kickoff callMilestone meeting with all
+project involved people and
+relevant stakeholders and
+team leadsTraining material created
+and published in
+Confluence
+Get rough estimate by
+Design, BE, FE regarding
+project effort, feasibility
+and resource outlook and
+add it to 
+.corresponding
+Discovery pageAll Assets created by
+DesignTraining session planned
+and completed with Sales
+and CS
+Create a project chat
+involving only key
+stakeholders (PM, BE, FE,
+QA, DES, CSM)Write all user stories Release notes preparedProject Specific Tasks
+Specific tasks you need to do in this exact project
+Tasks from Meetings
+Task report
+Looking good, no incomplete tasks.Add final links to the Epic
+and confluence project
+page (miro, figma…)Help Center article created
+or updated with CS
+QA review of the tickets Marketing and relevant
+Design Material for Release
+announcements ready
+Initiated pricing strategy
+with finance (when
+applicable)Pricing strategy is ready for
+release, finance articles
+created, contract updated
+Initiated legal evaluation,
+impact and task (when
+applicable)Legal adjustment are ready
+for release like T&C
+adjustments
+Confident with Epic scope:
+Review epic for first release
+and evaluate value
+compared to effort, is MVP
+fine or do we need more
+value or iterationsWebsite adjustment are
+ready for release
+Included in release
+candidate: add <release
+candidate number> here
+Finalize documentation and
+close relevant tickets (DBT,
+RICE)
+Follow next iterations
+based on your priorities
+Task_1
+Adjust “Task report” for your project. Click on “Task report”, click editing button (pencil),
+and from “Space(s) and page(s)” select your project/project meetings. Sub-pages
+Batch Redaction (1.1): Final Product Description

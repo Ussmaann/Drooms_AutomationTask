@@ -1,0 +1,10 @@
+{
+  "action": "new",
+  "query_title": "BATCH_REDACTION (Redaction 1.1)",
+  "matched_title": null,
+  "matched_url": null,
+  "matched_id": null,
+  "score": 0.0,
+  "candidates": [],
+  "api_base": "https://desk.zoho.eu/api/v1"
+}
