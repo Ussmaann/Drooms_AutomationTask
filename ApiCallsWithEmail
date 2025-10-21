@@ -1,0 +1,720 @@
+# -*- coding: utf-8 -*-
+"""
+Code 2 — Confluence/Zoho title match + Gmail email send/receive (API-first attachments + Confluence HTML fallback)
+
+What's improved:
+- API-first matching AND attachments: when API calls succeed, attachments are downloaded from the APIs
+  - Confluence -> Try PDF export; if blocked (403/non-OK), fall back to REST body.export_view HTML
+  - Zoho Desk -> HTML/TXT content
+- Fallback to local files only when the respective API fails or API download fails
+- Safer for Gmail: attachment size guard (~22 MB per file, ~24 MB total)
+- Robust SMTP: retries for SSL & STARTTLS, optional SSL preflight NOOP
+- Returns (ok, msgid, err) on send; emits stable Message-ID for reply threading
+- IMAP reply wait: Message-ID threading + normalized subject, INBOX + All Mail, UTF-8
+- Default reply wait is 2 minutes (can override with WAIT_FOR_REPLY_MINUTES)
+
+Env you'll want:
+  CONFLUENCE_BASE, CONFLUENCE_EMAIL, CONFLUENCE_API_TOKEN
+  ZOHO_API_BASE (optional), ZOHO_ORG_ID, ZOHO_OAUTH_TOKEN
+  CONFLUENCE_LOCAL_DIR, ZOHO_LOCAL_DIR
+  SENDER_EMAIL, MANAGER_EMAIL, SMTP_USER (optional), SMTP_PASS, IMAP_USER (optional), IMAP_PASS (optional)
+  SMTP_HOST (default: smtp.gmail.com), SMTP_PORT (optional), SMTP_DEBUG (0/1), SMTP_PREFLIGHT (0/1)
+  WAIT_FOR_REPLY_MINUTES (default: 2)
+"""
+
+from __future__ import annotations
+
+# ---------- imports ----------
+
+import smtplib
+from email.message import EmailMessage
+from email.header import decode_header, make_header
+from email.utils import make_msgid
+
+import os, re, sys, time, ssl, mimetypes, itertools, difflib, email, imaplib, json
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+from typing import List, Tuple, Optional, Dict
+from dataclasses import dataclass
+
+import requests
+from requests.auth import HTTPBasicAuth
+
+# ---------- env ----------
+try:
+    from dotenv import load_dotenv
+    # Load a dedicated file if you have it; fall back to default .env otherwise.
+    if Path(".env.apicalls").exists():
+        load_dotenv(".env.apicalls")
+    else:
+        load_dotenv()
+except Exception:
+    pass
+
+def need(k: str) -> str:
+    v = os.getenv(k)
+    if not v:
+        print(f"Missing env var: {k}", file=sys.stderr); sys.exit(1)
+    return v
+
+# ---------- helpers ----------
+def norm(t: str) -> str:
+    return re.sub(r"[^a-z0-9]+", " ", (t or "").lower()).strip()
+
+def best_pair(A: List[str], B: List[str]) -> Tuple[Optional[str], Optional[str], float]:
+    if not A or not B:
+        return None, None, 0.0
+    best = (None, None, 0.0)
+    for x, y in itertools.product(A, B):
+        s = difflib.SequenceMatcher(None, norm(x), norm(y)).ratio()
+        if s > best[2]:
+            best = (x, y, s)
+    return best
+
+def titles_from_folder(path: str) -> List[str]:
+    p = Path(path or ".")
+    files = sorted([*p.glob("*.pdf"), *p.glob("*.md"), *p.glob("*.html"), *p.glob("*.txt")])
+    return [f.stem.strip() for f in files]
+
+def print_list(label: str, titles: List[str], source: str) -> None:
+    print(f"\n{label} ({source}): {len(titles)}")
+    for i, t in enumerate(titles, 1):
+        print(f"  {i}. {t}")
+
+# ---------- small utility for saving content ----------
+def _save_bytes_to(path: Path, content_iter, chunk: int = 65536):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "wb") as f:
+        if isinstance(content_iter, (bytes, bytearray)):
+            f.write(content_iter)
+        else:
+            for c in content_iter:
+                f.write(c)
+
+@dataclass
+class ArticleMeta:
+    id: Optional[str] = None
+    title: str = ""
+    api_ok: bool = False
+
+# ---------- Confluence: API -> titles (+ id map) or local ----------
+def confluence_titles() -> Tuple[List[str], str, Dict[str, str]]:
+    site  = need("CONFLUENCE_BASE").rstrip("/")
+    email_addr = need("CONFLUENCE_EMAIL")
+    token = need("CONFLUENCE_API_TOKEN")
+    local = os.getenv("CONFLUENCE_LOCAL_DIR", "./confluence")
+    H = {"Accept": "application/json"}
+    auth = HTTPBasicAuth(email_addr, token)
+
+    def cget(url, **kw):
+        try:
+            r = requests.get(url, headers=H, auth=auth, timeout=30, **kw)
+            print(f"Confluence GET {url} -> {r.status_code} ({'SUCCESS' if r.ok else 'FAIL'})")
+            return r
+        except Exception as e:
+            print(f"Confluence API error {url}: {e}")
+            return None
+
+    # Try v2 pages first; collect IDs
+    r = cget(f"{site}/wiki/api/v2/pages", params={"limit": "200"})
+    if r and r.ok:
+        try:
+            j = r.json()
+            items = j.get("results") or []
+            titles = []
+            id_map: Dict[str, str] = {}
+            for it in items:
+                t = (it.get("title") or "").strip()
+                pid = str(it.get("id") or "").strip()
+                if t:
+                    titles.append(t)
+                    if pid:
+                        id_map[t] = pid
+            if titles:
+                return titles, "api", id_map
+        except Exception:
+            pass
+
+    # v1 search fallback
+    r = cget(f"{site}/wiki/rest/api/search",
+             params={"cql": "type=page ORDER BY created DESC", "limit": "200"})
+    if r and r.ok:
+        try:
+            j = r.json()
+            titles = []
+            id_map: Dict[str, str] = {}
+            for it in j.get("results", []):
+                c = (it.get("content") or {})
+                if c.get("type") == "page":
+                    t = (c.get("title") or "").strip()
+                    pid = str(c.get("id") or "").strip()
+                    if t:
+                        titles.append(t)
+                        if pid:
+                            id_map[t] = pid
+            if titles:
+                return titles, "api", id_map
+        except Exception:
+            pass
+
+    # local fallback
+    titles = titles_from_folder(local)
+    print(f"Confluence Fallback (local: {local}) -> {'SUCCESS' if titles else 'EMPTY'}")
+    return titles, "local", {}
+
+# ---------- Zoho: API -> titles (+ id map) or local ----------
+def zoho_titles() -> Tuple[List[str], str, Dict[str, str]]:
+    base = (os.getenv("ZOHO_API_BASE", "https://desk.zoho.eu/api/v1") or "").strip().rstrip("/")
+    org  = (os.getenv("ZOHO_ORG_ID") or "").strip()
+    tok  = (os.getenv("ZOHO_OAUTH_TOKEN") or "").strip().replace(" ", "")
+    local = os.getenv("ZOHO_LOCAL_DIR", "./zoho")
+
+    print(f"Zoho DC: {base}")
+    print(f"Zoho orgId: {org}")
+    print(f"Zoho token: {tok[:6]}... (len={len(tok)})")
+
+    H = {"Authorization": f"Zoho-oauthtoken {tok}", "orgId": org, "Accept": "application/json"}
+    url = f"{base}/articles"
+
+    try:
+        r = requests.get(url, headers=H, timeout=30)
+        print(f"Zoho GET {url} -> {r.status_code} ({'SUCCESS' if r.ok else 'FAIL'})")
+        if r.ok:
+            j = r.json()
+            items = j if isinstance(j, list) else j.get("data") or j.get("articles") or j.get("items") or []
+            titles: List[str] = []
+            id_map: Dict[str, str] = {}
+            for it in items:
+                t = ((it.get("title") or it.get("name") or "")).strip()
+                aid = str(it.get("id") or it.get("articleId") or "").strip()
+                if t:
+                    titles.append(t)
+                    if aid:
+                        id_map[t] = aid
+            if titles:
+                return titles, "api", id_map
+        else:
+            msg = (r.text or "")[:1000]
+            print(f"Zoho error body (first 1k): {msg}", file=sys.stderr)
+    except Exception as e:
+        print(f"Zoho API error: {e}")
+
+    titles = titles_from_folder(local)
+    print(f"Zoho Fallback (local: {local}) -> {'SUCCESS' if titles else 'EMPTY'}")
+    return titles, "local", {}
+
+# ---------- API attachment download helpers ----------
+def download_confluence_export_view_html(site: str, auth: HTTPBasicAuth, title: str, page_id: str) -> Optional[Path]:
+    """
+    Downloads Confluence Cloud page HTML via REST (body.export_view) and saves it.
+    """
+    try:
+        url = f"{site}/wiki/rest/api/content/{page_id}?expand=body.export_view"
+        r = requests.get(url, auth=auth, timeout=60)
+        if not r.ok:
+            print(f"[warn] Confluence export_view GET failed for {page_id}: {r.status_code}")
+            return None
+        j = r.json() or {}
+        body = ((j.get("body") or {}).get("export_view") or {}).get("value") or ""
+        if not body:
+            print(f"[warn] Confluence export_view empty for {page_id}")
+            return None
+        safe = re.sub(r"[^A-Za-z0-9._-]+", "_", title or page_id).strip("_") or page_id
+        out = Path("confluence_api") / f"{safe}.html"
+        out.parent.mkdir(parents=True, exist_ok=True)
+        with open(out, "w", encoding="utf-8", errors="ignore") as f:
+            f.write(body)
+        return out
+    except Exception as e:
+        print(f"[warn] Confluence export_view error for {page_id}: {e}")
+        return None
+
+def download_confluence_article_pdf(site: str, auth: HTTPBasicAuth, title: str, page_id: str) -> Optional[Path]:
+    """
+    Try FlyingPDF export first; if it fails (403/non-OK), fall back to body.export_view HTML.
+    """
+    try:
+        url = f"{site}/wiki/spaces/flyingpdf/pdfpageexport.action?pageId={page_id}"
+        r = requests.get(url, auth=auth, stream=True, timeout=60)
+        if r.ok and r.headers.get("Content-Type","").lower().startswith("application/pdf"):
+            safe = re.sub(r"[^A-Za-z0-9._-]+", "_", title or page_id).strip("_") or page_id
+            out = Path("confluence_api") / f"{safe}.pdf"
+            _save_bytes_to(out, r.iter_content(65536))
+            return out
+        else:
+            print(f"[warn] Confluence PDF export failed for {page_id}: {r.status_code}")
+    except Exception as e:
+        print(f"[warn] Confluence PDF export error for {page_id}: {e}")
+
+    # Fallback to HTML via REST (API-first behavior preserved)
+    return download_confluence_export_view_html(site, auth, title, page_id)
+
+def download_zoho_article_html(base: str, headers: dict, title: str, article_id: str) -> Optional[Path]:
+    """
+    Fetches a Zoho Desk KB article and saves its HTML (or plain) content to a file for attachment.
+    Returns the saved file path or None on failure.
+    """
+    try:
+        url = f"{base.rstrip('/')}/articles/{article_id}"
+        r = requests.get(url, headers=headers, timeout=60)
+        if not r.ok:
+            print(f"[warn] Zoho article GET failed for {article_id}: {r.status_code}")
+            return None
+        j = r.json()
+        html = (j.get("content") or j.get("contentHtml") or j.get("content_text") or j.get("description") or "")
+        if not html:
+            html = f"<pre>{json.dumps(j)[:200000]}</pre>"
+            ext = "html"
+        else:
+            ext = "html" if "<" in html else "txt"
+        safe = re.sub(r"[^A-Za-z0-9._-]+", "_", title or article_id).strip("_") or article_id
+        out = Path("zoho_api") / f"{safe}.{ext}"
+        out.parent.mkdir(parents=True, exist_ok=True)
+        with open(out, "w", encoding="utf-8", errors="ignore") as f:
+            f.write(html)
+        return out
+    except Exception as e:
+        print(f"[warn] Zoho article fetch error for {article_id}: {e}")
+        return None
+
+# ---------- Gmail-safe attachment handling ----------
+GMAIL_MAX_FILE_MB = 22.0     # conservative per-file cap
+GMAIL_MAX_TOTAL_MB = 24.0    # conservative total cap
+
+def _bytes_to_mb(n: int) -> float:
+    return n / (1024 * 1024)
+
+def _filter_attachments_for_gmail_limit(paths: List[Path]) -> Tuple[List[Path], List[str]]:
+    kept: List[Path] = []
+    notes: List[str] = []
+    total = 0.0
+    for p in paths:
+        try:
+            if not p.exists() or not p.is_file():
+                notes.append(f"[warn] Attachment missing: {p}")
+                continue
+            size_mb = _bytes_to_mb(p.stat().st_size)
+            if size_mb > GMAIL_MAX_FILE_MB:
+                notes.append(f"[warn] Skipping '{p.name}' ({size_mb:.2f} MB > {GMAIL_MAX_FILE_MB:.0f} MB cap).")
+                continue
+            if total + size_mb > GMAIL_MAX_TOTAL_MB:
+                notes.append(f"[warn] Skipping '{p.name}' to keep total under ~{GMAIL_MAX_TOTAL_MB:.0f} MB.")
+                continue
+            kept.append(p)
+            total += size_mb
+        except Exception as e:
+            notes.append(f"[warn] Could not inspect '{p}': {e}")
+    return kept, notes
+
+# ---------- Email sending (robust) ----------
+def send_email_with_attachments_smtp(
+    subject: str,
+    body: str,
+    to_addrs: List[str],
+    cc_addrs: Optional[List[str]],
+    attachment_paths: List[Path],
+    smtp_user: str,
+    smtp_pass: str,
+    smtp_host: str = "smtp.gmail.com",
+    smtp_port: Optional[int] = None,  # None -> use 465 for SSL, 587 for STARTTLS
+    smtp_debug: int = 0,
+    smtp_preflight: int = 1,          # one-shot SSL NOOP check before tries
+) -> Tuple[bool, Optional[str], Optional[str]]:
+    """
+    Returns (sent_ok, sent_message_id, error)
+    """
+    # Build message
+    msg = EmailMessage()
+    msg["Subject"] = subject
+    msg["From"] = smtp_user
+    msg["To"] = ", ".join([a for a in to_addrs or [] if a])
+    if cc_addrs:
+        msg["Cc"] = ", ".join([a for a in cc_addrs if a])
+    msg.set_content(body)
+
+    # Stable Message-ID for threading
+    if not msg.get("Message-ID"):
+        msg["Message-ID"] = make_msgid()
+    sent_message_id = str(msg["Message-ID"])
+
+    # Gmail-safe attachment filter
+    filtered_atts, att_notes = _filter_attachments_for_gmail_limit([Path(p) for p in (attachment_paths or [])])
+    for note in att_notes:
+        print(note)
+    for p in filtered_atts:
+        try:
+            ctype, _ = mimetypes.guess_type(str(p))
+            if not ctype:
+                ctype = "application/octet-stream"
+            maintype, subtype = ctype.split("/", 1)
+            with open(p, "rb") as f:
+                msg.add_attachment(f.read(), maintype=maintype, subtype=subtype, filename=p.name)
+        except Exception as e:
+            print(f"[warn] failed to attach {p}: {e}")
+
+    # Optional SSL preflight
+    if smtp_preflight:
+        try:
+            port = (smtp_port or 465)
+            print(f"Preflight: SMTP_SSL {smtp_host}:{port} …")
+            with smtplib.SMTP_SSL(smtp_host, port, context=ssl.create_default_context(), timeout=30) as s:
+                if smtp_debug:
+                    s.set_debuglevel(1)
+                s.login(smtp_user, smtp_pass)
+                code, resp = s.noop()
+                print("Preflight OK:", code, resp)
+        except Exception as e:
+            return False, None, f"Preflight failed: {e}"
+
+    # Send with retries on both modes
+    attempts = [
+        ("SSL", smtp_host, smtp_port or 465),
+        ("STARTTLS", smtp_host, 587 if (smtp_port is None) else smtp_port),
+    ]
+    last_err: Optional[str] = None
+
+    for mode, host, port in attempts:
+        for i in range(3):
+            try:
+                if mode == "SSL":
+                    s = smtplib.SMTP_SSL(host, port, timeout=60)
+                else:
+                    s = smtplib.SMTP(host, port, timeout=60)
+
+                if smtp_debug:
+                    s.set_debuglevel(1)
+
+                if mode == "STARTTLS":
+                    s.ehlo(); s.starttls(context=ssl.create_default_context()); s.ehlo()
+
+                s.login(smtp_user, smtp_pass)
+                s.send_message(msg)
+                try:
+                    s.quit()
+                except Exception:
+                    pass
+                return True, sent_message_id, None
+            except smtplib.SMTPServerDisconnected as e:
+                last_err = f"{mode} disconnected (attempt {i+1}/3): {e}"
+                time.sleep(1.5 * (i + 1))
+                continue
+            except Exception as e:
+                last_err = f"{mode} error (attempt {i+1}/3): {e}"
+                time.sleep(1.25 * (i + 1))
+                continue
+
+    return False, None, last_err or "Unknown SMTP error"
+
+# ---------- Read plain text from email payload ----------
+def _get_email_text(payload) -> str:
+    if payload.is_multipart():
+        for part in payload.walk():
+            ctype = part.get_content_type()
+            disp = part.get("Content-Disposition", "")
+            if ctype == "text/plain" and "attachment" not in (disp or "").lower():
+                try:
+                    return part.get_content().strip()
+                except Exception:
+                    try:
+                        return part.get_payload(decode=True).decode(
+                            part.get_content_charset() or "utf-8",
+                            errors="ignore",
+                        ).strip()
+                    except Exception:
+                        continue
+        part = payload.get_payload(0)
+        try:
+            return part.get_content().strip()
+        except Exception:
+            return ""
+    else:
+        try:
+            return payload.get_content().strip()
+        except Exception:
+            return payload.get_payload(decode=True).decode(
+                payload.get_content_charset() or "utf-8", errors="ignore"
+            ).strip()
+
+# ---------- Subject normalization & IMAP reply wait ----------
+REPLY_PREFIXES = (
+    "re:", "fw:", "fwd:", "aw:", "wg:", "sv:", "odp:", "rv:", "tr:",
+    "ré:", "enc:", "res:", "resposta:", "答复:", "回复:", "答覆:", "回复："
+)
+
+def _normalize_subject(s: str) -> str:
+    s = (s or "").strip()
+    sl = s.lower()
+    changed = True
+    while changed:
+        changed = False
+        for p in REPLY_PREFIXES:
+            if sl.startswith(p):
+                s = s[len(p):].strip()
+                sl = s.lower()
+                changed = True
+    s = re.sub(r"\s+", " ", s)
+    return s
+
+def wait_for_reply_imap(
+    original_subject: str,
+    expect_from: str,
+    imap_user: str,
+    imap_pass: str,
+    imap_host: str = "imap.gmail.com",
+    mailbox: str = "INBOX",
+    timeout_minutes: int = 2,            # default 2 minutes
+    poll_interval_seconds: int = 10,     # faster polls for short window
+    sent_message_id: Optional[str] = None,
+) -> dict:
+    """
+    Looks for a reply either by Message-ID threading (In-Reply-To/References)
+    or by normalized subject + expected sender. Searches INBOX and "[Gmail]/All Mail".
+    """
+    deadline = datetime.now(timezone.utc) + timedelta(minutes=timeout_minutes)
+    subj_norm = _normalize_subject(original_subject)
+    expect_from_l = (expect_from or "").lower()
+
+    def _select_box(conn, box: str) -> bool:
+        try:
+            typ, _ = conn.select(box)
+            return typ == "OK"
+        except Exception:
+            return False
+
+    def _matches(payload) -> bool:
+        from_hdr = str(make_header(decode_header(payload.get("From", ""))))
+        from_ok = (expect_from_l in from_hdr.lower()) if expect_from_l else True
+
+        # Message-ID threading
+        if sent_message_id:
+            in_reply = " ".join([
+                payload.get("In-Reply-To", "") or "",
+                payload.get("References", "") or "",
+            ])
+            if sent_message_id.strip("<>") in in_reply.replace("<", "").replace(">", ""):
+                return True
+
+        subj_hdr = str(make_header(decode_header(payload.get("Subject", ""))))
+        subj_ok = _normalize_subject(subj_hdr) == subj_norm
+        return from_ok and subj_ok
+
+    while datetime.now(timezone.utc) < deadline:
+        try:
+            conn = imaplib.IMAP4_SSL(imap_host, 993)
+            try:
+                conn.login(imap_user, imap_pass)
+            except Exception:
+                conn.logout()
+                time.sleep(poll_interval_seconds)
+                continue
+
+            try:
+                conn.enable("UTF8=ACCEPT")  # Gmail supports UTF-8
+            except Exception:
+                pass
+
+            tried_boxes = []
+            for box in [mailbox, '"[Gmail]/All Mail"', "INBOX"]:
+                if box in tried_boxes:
+                    continue
+                tried_boxes.append(box)
+                if not _select_box(conn, box):
+                    continue
+
+                since = (datetime.now(timezone.utc) - timedelta(days=2)).strftime("%d-%b-%Y")
+                typ, data = conn.search(None, f'(SINCE {since})')
+                if typ != "OK" or not data or not data[0]:
+                    continue
+
+                for msg_id in reversed(data[0].split()):
+                    typ, msgdata = conn.fetch(msg_id, "(RFC822)")
+                    if typ != "OK" or not msgdata or not msgdata[0]:
+                        continue
+                    raw = msgdata[0][1]
+                    payload = email.message_from_bytes(raw)
+                    if _matches(payload):
+                        body_text = _get_email_text(payload)
+                        result = {
+                            "found": True,
+                            "from": str(make_header(decode_header(payload.get("From","")))),
+                            "subject": str(make_header(decode_header(payload.get("Subject","")))),
+                            "date": payload.get("Date",""),
+                            "body": (body_text or "").strip()[:5000],
+                            "mailbox": box,
+                        }
+                        conn.logout()
+                        return result
+
+            conn.logout()
+        except Exception:
+            # swallow & retry
+            pass
+        time.sleep(poll_interval_seconds)
+
+    return {"found": False}
+
+# ---------- local file resolution for titles ----------
+def _best_file_for_title(dir_path: str, title: str) -> Optional[Path]:
+    d = Path(dir_path or ".")
+    if not d.exists():
+        return None
+    files = sorted([*d.glob("*.*")])
+    if not files:
+        return None
+    title_norm = norm(title)
+    best = (None, 0.0)
+    for f in files:
+        s = difflib.SequenceMatcher(None, title_norm, norm(f.stem)).ratio()
+        if s > best[1]:
+            best = (f, s)
+    return best[0]
+
+# ---------- main flow ----------
+if __name__ == "__main__":
+    # Pull titles (now with id maps)
+    c_titles, c_src, c_idmap = confluence_titles()
+    z_titles, z_src, z_idmap = zoho_titles()
+
+    print_list("Confluence titles", c_titles, c_src)
+    print_list("Zoho KB titles", z_titles, z_src)
+
+    x, y, s = best_pair(c_titles, z_titles)
+    print("\nBest match:")
+    if not (x and y):
+        print("  Not enough titles to compare.")
+        sys.exit(0)
+    print(f'  "{x}"  <->  "{y}"   (similarity={s:.2f})')
+
+    # Prepare attachments per your rule:
+    # - If API worked for a system, download/attach from API
+    # - If API failed (local), attach best local file from that system's local dir
+    atts: List[Path] = []
+
+    # Confluence
+    conf_dir = os.getenv("CONFLUENCE_LOCAL_DIR", "./confluence")
+    site  = os.getenv("CONFLUENCE_BASE","").rstrip("/")
+    email_addr = os.getenv("CONFLUENCE_EMAIL","")
+    token = os.getenv("CONFLUENCE_API_TOKEN","")
+    conf_auth = HTTPBasicAuth(email_addr, token) if (email_addr and token) else None
+
+    if c_src == "api" and c_idmap.get(x) and conf_auth and site:
+        conf_api_file = download_confluence_article_pdf(site, conf_auth, x, c_idmap[x])  # PDF or HTML fallback
+        if conf_api_file and conf_api_file.exists():
+            atts.append(conf_api_file)
+        else:
+            # Hard fallback to local if API download failed
+            conf_file = _best_file_for_title(conf_dir, x)
+            if conf_file and conf_file.exists():
+                atts.append(conf_file)
+            else:
+                print(f"[warn] Confluence file for '{x}' not found (API+local).")
+    else:
+        conf_file = _best_file_for_title(conf_dir, x)
+        if conf_file and conf_file.exists():
+            atts.append(conf_file)
+        else:
+            print(f"[warn] Confluence file for '{x}' not found in {conf_dir}")
+
+    # Zoho
+    zoho_dir = os.getenv("ZOHO_LOCAL_DIR", "./zoho")
+    zoho_base = (os.getenv("ZOHO_API_BASE", "https://desk.zoho.eu/api/v1") or "").strip().rstrip("/")
+    zoho_org  = (os.getenv("ZOHO_ORG_ID") or "").strip()
+    zoho_tok  = (os.getenv("ZOHO_OAUTH_TOKEN") or "").strip().replace(" ", "")
+    zoho_H = {"Authorization": f"Zoho-oauthtoken {zoho_tok}", "orgId": zoho_org, "Accept": "application/json"} if (zoho_org and zoho_tok) else None
+
+    if z_src == "api" and z_idmap.get(y) and zoho_H and zoho_base:
+        zoho_api_file = download_zoho_article_html(zoho_base, zoho_H, y, z_idmap[y])
+        if zoho_api_file and zoho_api_file.exists():
+            atts.append(zoho_api_file)
+        else:
+            # Hard fallback to local if download failed
+            zoho_file = _best_file_for_title(zoho_dir, y)
+            if zoho_file and zoho_file.exists():
+                atts.append(zoho_file)
+            else:
+                print(f"[warn] Zoho file for '{y}' not found (API+local).")
+    else:
+        zoho_file = _best_file_for_title(zoho_dir, y)
+        if zoho_file and zoho_file.exists():
+            atts.append(zoho_file)
+        else:
+            print(f"[warn] Zoho file for '{y}' not found in {zoho_dir}")
+
+    # Compose & send email (Gmail)
+    me_addr      = (os.getenv("SENDER_EMAIL","") or "").strip()
+    manager_addr = (os.getenv("MANAGER_EMAIL","") or "").strip()
+    smtp_user    = (os.getenv("SMTP_USER", me_addr) or "").strip()
+    smtp_pass    = (os.getenv("SMTP_PASS","") or "").strip().replace(" ","")
+    imap_user    = (os.getenv("IMAP_USER", me_addr) or "").strip()
+    imap_pass    = (os.getenv("IMAP_PASS", smtp_pass) or "").strip().replace(" ","")
+
+    smtp_host = (os.getenv("SMTP_HOST","smtp.gmail.com") or "smtp.gmail.com").strip()
+    smtp_port_env = os.getenv("SMTP_PORT","").strip()
+    smtp_port = int(smtp_port_env) if smtp_port_env.isdigit() else None
+    smtp_debug = int(os.getenv("SMTP_DEBUG","0") or "0")
+    smtp_preflight = int(os.getenv("SMTP_PREFLIGHT","1") or "1")
+
+    if not (smtp_user and smtp_pass and me_addr and manager_addr):
+        print("[error] Missing email env vars. Need SENDER_EMAIL, MANAGER_EMAIL, SMTP_PASS (and optionally SMTP_USER/IMAP_*).")
+        sys.exit(0)
+
+    subject = f"[Review Request] {x}  ↔  {y}"
+    body = (
+        "Hi,\n\n"
+        "Please review the attached matched articles and either:\n"
+        " - Suggest changes\n"
+        " - Approve\n\n"
+        f"Match similarity: {s:.2f}\n"
+        f"Confluence candidate: {x}\n"
+        f"Zoho candidate: {y}\n\n"
+        "Reply to this email with your feedback or 'Approved'.\n\n"
+        "Thanks!"
+    )
+
+    sent, sent_msgid, send_err = send_email_with_attachments_smtp(
+        subject=subject,
+        body=body,
+        to_addrs=[manager_addr],
+        cc_addrs=[me_addr],
+        attachment_paths=atts,
+        smtp_user=smtp_user,
+        smtp_pass=smtp_pass,
+        smtp_host=smtp_host,
+        smtp_port=smtp_port,
+        smtp_debug=smtp_debug,
+        smtp_preflight=smtp_preflight,
+    )
+
+    if sent:
+        print(f"✅ Email sent to {manager_addr} (cc {me_addr}). Attachments: {[str(p) for p in atts]}")
+        print(f"Message-ID: {sent_msgid}")
+    else:
+        print(f"❌ Failed to send email. {send_err or ''}".strip())
+        sys.exit(0)
+
+    # Wait for reply (default 2 minutes; override via WAIT_FOR_REPLY_MINUTES)
+    wait_minutes = int(os.getenv("WAIT_FOR_REPLY_MINUTES", "2") or "2")
+    if wait_minutes > 0:
+        print(f">> Waiting up to {wait_minutes} minute(s) for a reply from {manager_addr}…")
+        reply = wait_for_reply_imap(
+            original_subject=subject,
+            expect_from=manager_addr,
+            imap_user=imap_user,
+            imap_pass=imap_pass,
+            timeout_minutes=wait_minutes,
+            poll_interval_seconds=10,
+            sent_message_id=sent_msgid,
+        )
+        if reply.get("found"):
+            print("\n✅ Manager reply received:")
+            print("From:   ", reply["from"])
+            print("Date:   ", reply["date"])
+            print("Subject:", reply["subject"])
+            print("Mailbox:", reply.get("mailbox",""))
+            print("\n--- Reply Body (first 5k chars) ---\n")
+            print(reply["body"])
+            print("\n--- End Reply ---\n")
+        else:
+            print("\n⌛ No reply received within the wait window.")
+    else:
+        print("(not waiting for reply; set WAIT_FOR_REPLY_MINUTES>0 to enable)")

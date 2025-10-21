@@ -10,9 +10,16 @@ __pycache__/
 
 # --- Virtual environments ---
 .venv/
+.env.apicalls/
 venv/
 env/
 ENV/
+
+
+.env.apicalls
+confluence_api/
+zoho_api/
+
 
 # --- VS Code / IDEs ---
 .vscode/
