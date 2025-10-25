@@ -1,7 +1,0 @@
-$env:SMTP_USER="usman.verbinden@gmail.com"
-$env:SMTP_PASS="whoc ldns cfux vutv"
-$env:IMAP_USER="usman.verbinden@gmail.com"
-$env:IMAP_PASS="whoc ldns cfux vutv"
-$env:MANAGER_EMAIL="usman.alot761@gmail.com"
-$env:SENDER_EMAIL="usman.verbinden@gmail.com"
-$env:WAIT_FOR_REPLY_MINUTES="10"

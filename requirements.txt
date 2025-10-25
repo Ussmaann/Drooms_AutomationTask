@@ -1,0 +1,10 @@
+fastapi
+uvicorn[standard]
+python-multipart
+
+python-dotenv
+PyMuPDF
+rapidfuzz
+Pillow
+reportlab
+openai>=1.40

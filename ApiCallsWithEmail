@@ -14,7 +14,7 @@ What's improved:
 - Default reply wait is 2 minutes (can override with WAIT_FOR_REPLY_MINUTES)
 
 Env you'll want:
-  CONFLUENCE_BASE, CONFLUENCE_EMAIL, CONFLUENCE_API_TOKEN
+  confluencebase, confluenceemail, confluenceapitoken
   ZOHO_API_BASE (optional), ZOHO_ORG_ID, ZOHO_OAUTH_TOKEN
   CONFLUENCE_LOCAL_DIR, ZOHO_LOCAL_DIR
   SENDER_EMAIL, MANAGER_EMAIL, SMTP_USER (optional), SMTP_PASS, IMAP_USER (optional), IMAP_PASS (optional)
@@ -99,9 +99,9 @@ class ArticleMeta:
 
 # ---------- Confluence: API -> titles (+ id map) or local ----------
 def confluence_titles() -> Tuple[List[str], str, Dict[str, str]]:
-    site  = need("CONFLUENCE_BASE").rstrip("/")
-    email_addr = need("CONFLUENCE_EMAIL")
-    token = need("CONFLUENCE_API_TOKEN")
+    site  = need("confluencebase").rstrip("/")
+    email_addr = need("confluenceemail")
+    token = need("confluenceapitoken")
     local = os.getenv("CONFLUENCE_LOCAL_DIR", "./confluence")
     H = {"Accept": "application/json"}
     auth = HTTPBasicAuth(email_addr, token)
@@ -592,9 +592,9 @@ if __name__ == "__main__":
 
     # Confluence
     conf_dir = os.getenv("CONFLUENCE_LOCAL_DIR", "./confluence")
-    site  = os.getenv("CONFLUENCE_BASE","").rstrip("/")
-    email_addr = os.getenv("CONFLUENCE_EMAIL","")
-    token = os.getenv("CONFLUENCE_API_TOKEN","")
+    site  = os.getenv("confluencebase","").rstrip("/")
+    email_addr = os.getenv("confluenceemail","")
+    token = os.getenv("confluenceapitoken","")
     conf_auth = HTTPBasicAuth(email_addr, token) if (email_addr and token) else None
 
     if c_src == "api" and c_idmap.get(x) and conf_auth and site:
