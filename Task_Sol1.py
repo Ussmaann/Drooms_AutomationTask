@@ -1,59 +1,20 @@
-
     # -*- coding: utf-8 -*-
-
-
 from __future__ import annotations
-
-
-    # -*- coding: utf-8 -*-
-
-
 import sys
 try:
     sys.stdout.reconfigure(encoding="utf-8")
     sys.stderr.reconfigure(encoding="utf-8")
 except Exception:
     pass  
-
-
-
-# ---------- stdlib ----------
 import os, re, io, sys, base64, textwrap
 from pathlib import Path
 from dataclasses import dataclass, field
 from typing import List, Optional, Tuple
-
-# ---------- third-party ----------
-try:
-    from dotenv import load_dotenv
-except Exception:
-    load_dotenv = None
-
-try:
-    import fitz  # PyMuPDF
-except Exception:
-    print("[error] PyMuPDF not installed. pip install PyMuPDF")
-    sys.exit(1)
-
-try:
-    from rapidfuzz import fuzz, process as rfprocess
-except Exception:
-    print("[error] rapidfuzz not installed. pip install rapidfuzz")
-    sys.exit(1)
-
-try:
-    from PIL import Image
-except Exception:
-    print("[error] pillow not installed. pip install pillow")
-    sys.exit(1)
-
-try:
-    from openai import OpenAI
-except Exception:
-    print("[error] openai SDK not installed. pip install openai>=1.40")
-    sys.exit(1)
-
-# ReportLab
+from dotenv import load_dotenv
+import fitz  # PyMuPDF
+from rapidfuzz import fuzz, process as rfprocess
+from PIL import Image
+from openai import OpenAI
 from reportlab.lib.pagesizes import A4
 from reportlab.lib.units import mm
 from reportlab.lib.utils import ImageReader
@@ -63,9 +24,7 @@ from reportlab.lib import colors
 from reportlab.lib.styles import ParagraphStyle
 from xml.sax.saxutils import escape as html_escape
 
-# =========================
 # Load environment
-# =========================
 if load_dotenv:
     if Path(".env.apicalls").exists():
         load_dotenv(".env.apicalls", override=True, verbose=False)
@@ -76,38 +35,30 @@ confluence_directory = os.getenv("confluence_directory")
 zoho_directory       = os.getenv("zoho_directory")
 output_directory           = os.getenv("output_directory")
 openaiapi       = os.getenv("openaiapi")
-openaibaseurl      = os.getenv("openaibaseurl")  # optional
 
 if not (confluence_directory and zoho_directory and output_directory):
     print("[error] Missing env vars. Need confluence_directory, zoho_directory, output_directory")
     sys.exit(1)
 
-C_DIR  = Path(confluence_directory)
-Z_DIR  = Path(zoho_directory)
+c_dir  = Path(confluence_directory)
+z_dir  = Path(zoho_directory)
 OUTDIR = Path(output_directory)
 OUTDIR.mkdir(parents=True, exist_ok=True)
 
-# =========================
 # Helpers & data structures
-# =========================
-
 def norm(t: str) -> str:
     return re.sub(r"[^a-z0-9]+", " ", (t or "").lower()).strip()
-
 def sanitize_filename(name: str) -> str:
     name = re.sub(r'[<>:"/\\|?*\x00-\x1F]', "_", name)
     name = name.strip().rstrip(" .")
     return name or "untitled"
-
 def _wrap_text(txt: str) -> str:
     txt = re.sub(r"[ \t]+", " ", txt)
     txt = re.sub(r"\n{3,}", "\n\n", txt)
     return txt.strip()
 
-# ---------- Document-level classification ----------
-
+# keyword based classification for document
 def classify_article_type(text: str) -> str:
-    """Heuristic classification for the entire document."""
     t = (text or "").lower()
     if any(k in t for k in ["troubleshoot", "error", "failed to", "how to resolve", "workaround", "issue occurs"]):
         return "troubleshooting"
@@ -119,8 +70,7 @@ def classify_article_type(text: str) -> str:
         return "feature_update"
     return "process_update"
 
-# ---------- Embedding helpers ----------
-
+#to measure Similarity 
 def _cosine(u: list, v: list) -> float:
     if not u or not v or len(u) != len(v):
         return 0.0
@@ -157,7 +107,7 @@ def embed_text(client: OpenAI, text: str) -> Optional[list]:
     except Exception:
         return None
 
-# ---------- Data structures ----------
+#Data structures for images,paragraphs and sections
 @dataclass
 class ImgBlob:
     data: bytes
@@ -181,38 +131,34 @@ class DocStructure:
     title: str
     sections: List[Section]
 
-# ---------- Merge helpers & constants ----------
-SIM_THRESHOLD = 70  # section title match threshold (RapidFuzz token_sort_ratio)
 
-# Paragraph conflict detection thresholds/regex
-PARA_SIM_THRESHOLD = 86
-NUM_RE = re.compile(r'\b(\d+(?:\.\d+)*)\b', re.I)
+sim_threshold = 70  #section title match threshold 
+
+# Paragraph detection thresholds
+para_similarity = 85
+num_re = re.compile(r'\b(\d+(?:\.\d+)*)\b', re.I)
 
 def _numbers(text): 
-    return set(NUM_RE.findall(text or ""))
+    return set(num_re.findall(text or ""))
 
-def _negation_flags(text):
+def negflag(text):
     t = (text or "").lower()
     return any(k in t for k in [" not ", "no longer", " cannot", " can't", " won't", "deprecated", "removed"])
 
-def _looks_conflicting(a: str, b: str) -> bool:
+def findConflict(a: str, b: str) -> bool:
     # Only consider near-duplicates for conflict evaluation
-    if fuzz.token_set_ratio(a, b) < PARA_SIM_THRESHOLD:
+    if fuzz.token_set_ratio(a, b) < para_similarity:
         return False
-    # numbers/versions differ (e.g., v2.3 vs v2.4, counts, dates)
+    # numbers or versions differ (e.g., v2.3 vs v2.4, counts, dates)
     if _numbers(a) != _numbers(b):
         return True
-    # negation/semantics flip heuristics
-    if _negation_flags(a) != _negation_flags(b):
+    # flip heuristics
+    if negflag(a) != negflag(b):
         return True
     t = f"{a} || {b}".lower()
     return any(k in t for k in ["instead of", "replaced by", "changed to", "now supports", "no longer", "deprecated"])
 
-def _merge_paragraphs_keep_zoho(zoho_paras: List[ParagraphBlob], conf_paras: List[ParagraphBlob]) -> List[ParagraphBlob]:
-    """
-    Keep all Zoho paragraphs. Add all Confluence paragraphs.
-    Replace a Zoho paragraph only if there's a true conflict; otherwise append Confluence as additional detail.
-    """
+def mergeparagraph(zoho_paras: List[ParagraphBlob], conf_paras: List[ParagraphBlob]) -> List[ParagraphBlob]:
     merged = list(zoho_paras)  # keep Zoho by default
     for cp in (p for p in conf_paras if (p.text or "").strip()):
         # find nearest Zoho paragraph
@@ -221,8 +167,8 @@ def _merge_paragraphs_keep_zoho(zoho_paras: List[ParagraphBlob], conf_paras: Lis
             s = fuzz.token_set_ratio(cp.text, zp.text)
             if s > best_score:
                 best_zi, best_score = i, s
-        if best_zi is not None and best_score >= PARA_SIM_THRESHOLD:
-            if _looks_conflicting(zoho_paras[best_zi].text, cp.text):
+        if best_zi is not None and best_score >= para_similarity:
+            if findConflict(zoho_paras[best_zi].text, cp.text):
                 merged[best_zi] = ParagraphBlob(text=cp.text, is_new=True)  # Confluence wins on conflict
             else:
                 merged.append(ParagraphBlob(text=cp.text, is_new=True))      # complementary detail
@@ -233,10 +179,9 @@ def _merge_paragraphs_keep_zoho(zoho_paras: List[ParagraphBlob], conf_paras: Lis
 def _safe_image_sig(img: ImgBlob) -> Tuple[int, int]:
     return (len(img.data or b""), hash(img.data or b""))
 
-# ---------- ReportLab: cached styles ----------
+#ReportLab: to built pdf
 LIGHT_GREEN = colors.HexColor("#2ECC71")
 CAPTION_GRAY = colors.HexColor("#666666")
-
 STYLE_H1 = ParagraphStyle(
     name="H1", fontName="Helvetica-Bold", fontSize=18, leading=22, spaceAfter=8, alignment=TA_LEFT
 )
@@ -246,14 +191,13 @@ STYLE_H2 = ParagraphStyle(
 STYLE_BODY = ParagraphStyle(
     name="Body", fontName="Helvetica", fontSize=10, leading=14, spaceAfter=6, alignment=TA_LEFT
 )
-
-def _para(text: str, style: ParagraphStyle, color=None) -> Paragraph:
+def paraa(text: str, style: ParagraphStyle, color=None) -> Paragraph:
     safe = html_escape(text or "")
     if color is not None:
         style = ParagraphStyle(**{**STYLE_BODY.__dict__, "name": style.name + "_c", "textColor": color})
     return Paragraph(safe, style)
 
-def _scale_to_width(img_reader, max_w):
+def Scaletowidth(img_reader, max_w):
     iw, ih = img_reader.getSize()
     if iw <= 0 or ih <= 0:
         return max_w, max_w * 0.75
@@ -287,15 +231,12 @@ class BorderedImage(Flowable):
             c.setFillColor(self.caption_color)
             c.drawString(0, 0, self.caption)
 
-# ---------- PDF structure extraction (font-aware H1 & intro) ----------
-
+# Extract Pdf Structure
 def extract_pdf_structure(pdf_path: Path) -> DocStructure:
     doc = fitz.open(pdf_path)
     doc_title = pdf_path.stem
-
     sections: List[Section] = []
     current: Optional[Section] = None
-
     def page_median_font_size(textdict) -> float:
         sizes = []
         for block in textdict.get("blocks", []):
@@ -378,9 +319,9 @@ def extract_pdf_structure(pdf_path: Path) -> DocStructure:
         sections = [Section(title=doc_title)]
     return DocStructure(title=doc_title, sections=sections)
 
-# ---------- Merging (conflict-aware; lock first heading) ----------
+#Image Merging
 
-def _merge_images_keep_zoho(zoho_imgs: List[ImgBlob], conf_imgs: List[ImgBlob]) -> List[ImgBlob]:
+def MergeImages(zoho_imgs: List[ImgBlob], conf_imgs: List[ImgBlob]) -> List[ImgBlob]:
     merged = [ImgBlob(data=im.data, ext=im.ext, caption=im.caption, is_new=False) for im in zoho_imgs]
     seen = {_safe_image_sig(im) for im in zoho_imgs}
     for cim in conf_imgs:
@@ -390,8 +331,8 @@ def _merge_images_keep_zoho(zoho_imgs: List[ImgBlob], conf_imgs: List[ImgBlob]) 
             seen.add(sig)
     return merged
 
-def merge_inline(zoho: DocStructure, conf: DocStructure) -> DocStructure:
-    # Base: copy Zoho structure (all not-new)
+def mergeinline(zoho: DocStructure, conf: DocStructure) -> DocStructure:
+    # copy Zoho structure
     merged_sections: List[Section] = [
         Section(
             title=zs.title,
@@ -401,10 +342,10 @@ def merge_inline(zoho: DocStructure, conf: DocStructure) -> DocStructure:
         for zs in zoho.sections
     ]
 
-    # Build map of zoho titles for fuzzy section alignment
+    # fuzzy section alignment
     zoho_titles = [s.title for s in zoho.sections]
 
-    # For each Confluence section, align & union
+    # For each Confluence section
     for cs in conf.sections:
         new_paras = [ParagraphBlob(text=p.text, is_new=True) for p in cs.paragraphs if (p.text or "").strip()]
         new_imgs  = [ImgBlob(data=im.data, ext=im.ext, caption=im.caption, is_new=True) for im in cs.images]
@@ -412,18 +353,18 @@ def merge_inline(zoho: DocStructure, conf: DocStructure) -> DocStructure:
         idx = None
         if zoho_titles:
             match = rfprocess.extractOne(cs.title, zoho_titles, scorer=fuzz.token_sort_ratio)
-            if match and match[1] >= SIM_THRESHOLD:
+            if match and match[1] >= sim_threshold:
                 idx = match[2]
 
         if idx is not None:
-            # union with conflict awareness
-            merged_sections[idx].paragraphs = _merge_paragraphs_keep_zoho(merged_sections[idx].paragraphs, new_paras)
-            merged_sections[idx].images     = _merge_images_keep_zoho(merged_sections[idx].images, new_imgs)
+            #  conflict adjustment
+            merged_sections[idx].paragraphs = mergeparagraph(merged_sections[idx].paragraphs, new_paras)
+            merged_sections[idx].images     = MergeImages(merged_sections[idx].images, new_imgs)
         else:
-            # add as new section (all Confluence content)
+            # add as new section 
             merged_sections.append(Section(title=cs.title, paragraphs=new_paras, images=new_imgs))
 
-    # --- FIRST SECTION POLICY: lock Zoho title, union intro with Confluence, Confluence wins only on conflict ---
+    # 1st section: lock Zoho title, union intro with Confluence
     if merged_sections and zoho.sections:
         ms0 = merged_sections[0]
         zs0 = zoho.sections[0]
@@ -434,43 +375,43 @@ def merge_inline(zoho: DocStructure, conf: DocStructure) -> DocStructure:
             ms0.title = zs0.title
 
         # Recompute intro using raw Zoho/Confluence first-section paragraphs to be safe
-        ms0.paragraphs = _merge_paragraphs_keep_zoho(
+        ms0.paragraphs = mergeparagraph(
             [ParagraphBlob(text=p.text, is_new=False) for p in zs0.paragraphs],
             [ParagraphBlob(text=p.text, is_new=True)  for p in cs0.paragraphs]
         )
 
         # Merge images with dedupe (keep Zoho images, add Confluence new ones)
-        ms0.images = _merge_images_keep_zoho(zs0.images, cs0.images)
+        ms0.images = MergeImages(zs0.images, cs0.images)
 
     return DocStructure(title=f"{zoho.title} (updated)", sections=merged_sections)
 
-# ---------- Rendering ----------
+#Rendering
 
-def build_pdf(doc_struct: DocStructure, out_path: Path):
+def buildpdf(doc_struct: DocStructure, out_path: Path):
     out_path.parent.mkdir(parents=True, exist_ok=True)
     doc = SimpleDocTemplate(
         str(out_path), pagesize=A4, rightMargin=18*mm, leftMargin=18*mm, topMargin=18*mm, bottomMargin=18*mm
     )
     story = []
-    story.append(_para(doc_struct.title, STYLE_H1))
+    story.append(paraa(doc_struct.title, STYLE_H1))
     story.append(Spacer(1, 8))
 
     max_img_w = A4[0] - (doc.leftMargin + doc.rightMargin)
 
     for sec in doc_struct.sections:
-        story.append(_para(sec.title, STYLE_H2))
+        story.append(paraa(sec.title, STYLE_H2))
         story.append(Spacer(1, 4))
 
         for p in sec.paragraphs:
             color = LIGHT_GREEN if p.is_new else None
-            story.append(_para(p.text.strip(), STYLE_BODY, color=color))
+            story.append(paraa(p.text.strip(), STYLE_BODY, color=color))
 
         for im in sec.images:
             try:
                 img_reader = ImageReader(io.BytesIO(im.data))
             except Exception:
                 continue
-            w, h = _scale_to_width(img_reader, max_img_w)
+            w, h = Scaletowidth(img_reader, max_img_w)
             border = LIGHT_GREEN if im.is_new else None
             caption_text = "(new)" if im.is_new else (im.caption or None)
             story.append(Spacer(1, 6))
@@ -484,9 +425,8 @@ def build_pdf(doc_struct: DocStructure, out_path: Path):
 
     doc.build(story)
 
-# ---------- OpenAI recreation ----------
-
-def _extract_all_images(pdf_path: Path, max_images: int = 30):
+#Recreation with LLM
+def extractimages(pdf_path: Path, max_images: int = 30):
     imgs = []
     doc = fitz.open(pdf_path)
     counter = 1
@@ -526,7 +466,7 @@ def _extract_all_images(pdf_path: Path, max_images: int = 30):
             break
     return imgs
 
-def normalize_placeholders(md_text: str) -> str:
+def normalizeplaceholders(md_text: str) -> str:
     s = md_text
     s = re.sub(r'!\[\s*\]\(\s*ID:\s*(IMG\d{3})\s*\)', r'![screenshot](ID:\1)', s, flags=re.IGNORECASE)
     s = re.sub(r'!\[[^\]]*\]\(\s*ID:\s*(IMG\d{3})\s*\)', r'![screenshot](ID:\1)', s, flags=re.IGNORECASE)
@@ -561,7 +501,7 @@ def normalize_placeholders(md_text: str) -> str:
     s = re.sub(r'!\[screenshot\]\(\s*ID:\s*(IMG\d{3})\s*\)', r'![screenshot](ID:\1)', s, flags=re.IGNORECASE)
     return s
 
-def _markdown_to_pdf(md_text: str, images_index: dict, out_path: Path):
+def mdtopdf(md_text: str, images_index: dict, out_path: Path):
     lines = md_text.splitlines()
     doc = SimpleDocTemplate(
         str(out_path), pagesize=A4, rightMargin=18*mm, leftMargin=18*mm, topMargin=18*mm, bottomMargin=18*mm
@@ -570,7 +510,7 @@ def _markdown_to_pdf(md_text: str, images_index: dict, out_path: Path):
     max_img_w = A4[0] - (doc.leftMargin + doc.rightMargin)
 
     def add(text, style):
-        story.append(_para(text.strip(), style))
+        story.append(paraa(text.strip(), style))
         story.append(Spacer(1, 4))
 
     for raw in lines:
@@ -592,7 +532,7 @@ def _markdown_to_pdf(md_text: str, images_index: dict, out_path: Path):
                 if entry:
                     try:
                         img_reader = ImageReader(io.BytesIO(entry["data"]))
-                        w, h = _scale_to_width(img_reader, max_img_w)
+                        w, h = Scaletowidth(img_reader, max_img_w)
                         story.append(KeepTogether(BorderedImage(
                             img_reader, width=w, height=h, border_color=None,
                             caption=f"{img_id} (page {entry['page']})", caption_color=CAPTION_GRAY
@@ -605,7 +545,7 @@ def _markdown_to_pdf(md_text: str, images_index: dict, out_path: Path):
 
     doc.build(story)
 
-def recreate_with_openai(
+def recreatewithLLM(
     merged_pdf: Path,
     title_for_output: str,
     outdir: Path,
@@ -615,24 +555,24 @@ def recreate_with_openai(
     locked_intro: Optional[str] = None
 ):
     if not openaiapi:
-        print("[warn] openaiapi missing. Skipping recreate step.")
+        print("Warning: openaiapi missing. Skipping recreate step.")
         return None
 
     try:
-        client = OpenAI(api_key=openaiapi, base_url=openaibaseurl) if openaibaseurl else OpenAI(api_key=openaiapi)
+        client = OpenAI(api_key=openaiapi)
     except Exception as e:
-        print(f"[error] Failed to init OpenAI client: {e}")
+        print(f"Error: Failed to init OpenAI client: {e}")
         return None
 
     print("Preparing images for OpenAI …")
-    images = _extract_all_images(merged_pdf, max_images=30)
+    images = extractimages(merged_pdf, max_images=30)
     images_index = {e["id"]: e for e in images}
-    print(f"  -> screenshots: {len(images)}")
-    # NEW: provide the model the *full* source text so it doesn't omit details
-# (We read more pages and allow more chars than the default preview.)
+    print(f"screenshots: {len(images)}")
+
+#We read more pages and allow more chars than the default preview.)
     source_text = read_pdf_preview(merged_pdf, max_pages=50, max_chars=30000)
     if not source_text.strip():
-        print("[warn] Empty source_text from merged PDF. The model may miss details.")
+        print("warning: Empty source_text from merged PDF. The model may miss details.")
 
     # Locked content note (prevents model from rewriting H1/intro)
     lock_blocks = []
@@ -730,19 +670,19 @@ def recreate_with_openai(
         print(" OpenAI API call succeeded.")
         out_text = getattr(resp, "output_text", None)
         if out_text:
-            print("  --- Preview of first 400 chars ---")
+            print("   Preview Sample")
             print(out_text[:400])
-            print("  --- End preview ---")
+            print("   End preview")
     except Exception as e:
-        print(f"[error] OpenAI response failed: {e}")
+        print(f"Error: OpenAI response failed: {e}")
         return None
 
     md_text = getattr(resp, "output_text", "") or ""
     if not md_text.strip():
-        print("[error] Model returned empty content; aborting PDF build.")
+        print("[Model returned empty content; aborting PDF build.")
         return None
 
-    md_text = normalize_placeholders(md_text)
+    md_text = normalizeplaceholders(md_text)
 
     placeholders = re.findall(r'!\[screenshot\]\(ID:(IMG\d{3})\)', md_text)
     if not placeholders and images_index:
@@ -760,65 +700,62 @@ def recreate_with_openai(
         print(f"[warn] Could not save Markdown file: {e}")
 
     out_pdf_path = outdir / (sanitize_filename(f"{title_for_output} (recreated)") + ".pdf")
-    print(f"Building recreated PDF → {out_pdf_path}")
-    _markdown_to_pdf(md_text, images_index, out_pdf_path)
+    print(f"Building recreated PDF: {out_pdf_path}")
+    mdtopdf(md_text, images_index, out_pdf_path)
 
     if out_pdf_path.exists():
-        print(f"[success] OpenAI recreation completed: {out_pdf_path}")
+        print(f"OpenAI recreation completed: {out_pdf_path}")
     else:
-        print("[error] Recreated file was not generated.")
+        print("Recreated file was not generated.")
         return None
 
     return out_pdf_path
 
-# =========================
 # Main flow
-# =========================
-
 def main():
     print("Using:")
-    print("  Confluence dir:", C_DIR)
-    print("  Zoho dir      :", Z_DIR)
+    print("  Confluence dir:", c_dir)
+    print("  Zoho dir      :", z_dir)
     print("  Output dir    :", OUTDIR)
     print()
 
-    c_files = sorted(C_DIR.glob("*.pdf"))
-    z_files = sorted(Z_DIR.glob("*.pdf"))
+    c_files = sorted(c_dir.glob("*.pdf"))
+    z_files = sorted(z_dir.glob("*.pdf"))
     if not c_files or not z_files:
-        print("[error] Put your PDFs in the respective folders.")
+        print("Error: Put your PDFs in the respective folders.")
         return
 
-    # choose Confluence file (if many, pick the most descriptive/longest name)
-    conf_file = max(c_files, key=lambda p: len(p.stem))
+    # choose Confluence file 
+    conf_file = c_files[0]
 
-    # Doc-level classification (first few pages only)
-    conf_doc_type = classify_article_type(read_pdf_preview(conf_file, max_pages=3, max_chars=3000))
+    # Document classification for file type which we may can use  
+    conf_doc_type = classify_article_type(read_pdf_preview(conf_file, max_pages=1, max_chars=3000))
     print(f"\n Confluence document type: {conf_doc_type}")
 
     # Prepare OpenAI client only if needed later
     client = None
     if openaiapi:
         try:
-            client = OpenAI(api_key=openaiapi, base_url=openaibaseurl) if openaibaseurl else OpenAI(api_key=openaiapi)
+            client = OpenAI(api_key=openaiapi)
         except Exception:
             client = None
 
-    # Fuzzy title match first (Confluence->Zoho)
+    # Fuzzy title matching
     z_titles = [p.stem for p in z_files]
     match = rfprocess.extractOne(conf_file.stem, z_titles, scorer=fuzz.token_sort_ratio)
 
     zoho_file = None
     if match and match[1] >= 75:
-        zoho_file = Z_DIR / f"{match[0]}.pdf"
-        print(f'\n Fuzzy match → Zoho: "{zoho_file.name}" for Confluence: "{conf_file.name}" [score={match[1]:.1f}]')
+        zoho_file = z_dir / f"{match[0]}.pdf"
+        print(f'\n Fuzzy match for Zoho "{zoho_file.name}" and Confluence: "{conf_file.name}" [score={match[1]:.1f}]')
     else:
-        # Fall back to semantic match if API available
+        # Fall back to semantic match using 
         if client is None:
             print("[warn] No OpenAI client for semantic match. Please ensure titles are similar or set openaiapi.")
-            zoho_file = Z_DIR / f"{z_files[0].name}"
+            zoho_file = z_dir / f"{z_files[0].name}"
             print(f"[fallback] Using first Zoho file: {zoho_file.name}")
         else:
-            # semantic fallback via embeddings
+            # semantic fallback via Open AI embedding embeddings
             def best_zoho_by_semantics(conf_pdf: Path, zoho_dir: Path, client: OpenAI, *, min_chars: int = 120) -> Tuple[Optional[Path], float]:
                 conf_txt = read_pdf_preview(conf_pdf)
                 if len(conf_txt) < min_chars:
@@ -839,32 +776,32 @@ def main():
                         best_score, best_path = score, zpdf
                 return best_path, best_score
 
-            zoho_file, sem_score = best_zoho_by_semantics(conf_file, Z_DIR, client)
+            zoho_file, sem_score = best_zoho_by_semantics(conf_file, z_dir, client)
             if not zoho_file or sem_score < 0.65:
-                print("[warn] Semantic match failed or too low; using first Zoho file as fallback.")
-                zoho_file = Z_DIR / f"{z_files[0].name}"
+                print("warning Semantic match is too low")
+                zoho_file = z_dir / f"{z_files[0].name}"
             else:
-                print(f'\nSemantic match → Zoho: "{zoho_file.name}" for Confluence: "{conf_file.name}" [cos={sem_score:.3f}]')
+                print(f'\nSemantic match with Zoho: "{zoho_file.name}" and Confluence: "{conf_file.name}" [cos={sem_score:.3f}]')
 
-    # Extract structures (font-aware for intro)
+    # Extract structures from pdf files
     zoho_struct = extract_pdf_structure(zoho_file)
     conf_struct = extract_pdf_structure(conf_file)
 
-    # Merge (conflict-aware; lock first heading; keep all Zoho unless conflicting)
-    merged = merge_inline(zoho_struct, conf_struct)
+    # Merge the content from zoho and confluence files
+    merged = mergeinline(zoho_struct, conf_struct)
 
-    # Save updated (green) PDF
+    # Save updated merged PDF file
     out_name = sanitize_filename(f"{zoho_file.stem} (updated)") + ".pdf"
     merged_pdf_path = OUTDIR / out_name
-    print(f"\nBuilding merged PDF → {merged_pdf_path}")
-    build_pdf(merged, merged_pdf_path)
+    print(f"\nBuilding merged PDF  {merged_pdf_path}")
+    buildpdf(merged, merged_pdf_path)
     print(f" Done. Saved: {merged_pdf_path}")
 
-    # Recreate via OpenAI (vision) with locked H1 + merged intro
+    # Recreate pdf with OpenAI
     locked_h1   = zoho_struct.sections[0].title if zoho_struct.sections else zoho_file.stem
     locked_intro = "\n\n".join(p.text for p in (merged.sections[0].paragraphs if merged.sections else []) if (p.text or "").strip())
 
-    recreate_with_openai(
+    recreatewithLLM(
         merged_pdf_path,
         title_for_output=zoho_file.stem,
         outdir=OUTDIR,
